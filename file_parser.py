@@ -1,6 +1,7 @@
 import os
 from dataclasses import dataclass, field
 from pathlib import Path
+from typing import Optional
 
 import pandas as pd
 import structlog
@@ -176,77 +177,44 @@ class ExcelParser:
                 if best_score >= 70:
                     col_map[col_type] = best_idx
 
-        if "name" not in col_map:
+        if "name" not in col_map and "sku" not in col_map:
             return [], col_map
 
-        name_idx = col_map["name"]
         items: list[dict] = []
 
         for _, row in data.iterrows():
-            name_value = str(row.iloc[name_idx]).strip()
-            if not name_value or len(name_value) < 3 or is_junk_row(name_value):
-                continue
+            name_value = None
+            sku_value = None
+            unit_value = None
+            price_value = None
+            manufacturer_value = None
+            notes_value = None
 
-            item = {
-                "name": name_value,
-                "sku": "",
-                "unit": "шт",
-                "price": 0.0,
-                "manufacturer": "",
-                "notes": ""
+            if "name" in col_map:
+                name_value = row.iloc[col_map["name"]]
+            if "sku" in col_map:
+                sku_value = row.iloc[col_map["sku"]]
+            if "unit" in col_map:
+                unit_value = row.iloc[col_map["unit"]]
+            if "price" in col_map:
+                price_value = row.iloc[col_map["price"]]
+            if "manufacturer" in col_map:
+                manufacturer_value = row.iloc[col_map["manufacturer"]]
+            if "notes" in col_map:
+                notes_value = row.iloc[col_map["notes"]]
+
+            item_values: dict = {
+                "name_value": str(name_value) if name_value is not None and not pd.isna(name_value) else "",
+                "sku_value": str(sku_value) if sku_value is not None and not pd.isna(sku_value) else "",
+                "unit_value": str(unit_value) if unit_value is not None and not pd.isna(unit_value) else None,
+                "price_value": price_value,
+                "manufacturer_value": manufacturer_value,
+                "notes_value": notes_value
             }
 
-            for col_type, column_id in col_map.items():
-                if col_type == "name" or column_id >= len(row):
-                    continue
+            item = ExcelParser._build_item_from_row(item_values, raw_row=row, sku_col_idx=col_map.get("sku"))
 
-                value = row.iloc[column_id]
-                if pd.isna(value):
-                    continue
-
-                if col_type == "sku":
-                    item["sku"] = str(value).strip()
-                elif col_type == "unit":
-                    item["unit"] = normalize_unit(str(value).strip())
-
-
-                elif col_type == "price":
-
-                    parsed_price = parse_price(value)
-
-                    # защита от артикула вместо цены
-
-                    sku_val = ""
-
-                    if "sku" in col_map:
-                        sku_raw = row.iloc[col_map["sku"]]
-                        sku_val = str(sku_raw).strip() if not pd.isna(sku_raw) else ""
-
-                    sku_clean = sku_val.replace("-", "").replace(" ", "")
-
-                    if sku_clean and parsed_price is not None:
-                        try:
-                            if str(int(parsed_price)) in sku_clean:
-                                item["price"] = 0.0
-                            else:
-                                item["price"] = parsed_price
-
-                        except ValueError:
-                            item["price"] = parsed_price or 0.0
-
-                    else:
-
-                        item["price"] = parsed_price or 0.0
-
-                elif col_type == "manufacturer":
-                    item["manufacturer"] = str(value).strip()
-
-                elif col_type == "notes":
-                    item["notes"] = str(value).strip()
-
-                if not item["manufacturer"]:
-                    item["manufacturer"] = extract_vendor(name_value)
-
+            if item:
                 items.append(item)
 
         return items, col_map
@@ -260,7 +228,7 @@ class ExcelParser:
         res.method = f"{method_suffix}"
         res.confidence = quality(res.items)
 
-    # Fallback: стандартный парсер
+    # fallback: стандартный парсер
 
     def _standard_xlsx_fallback(self, p: Path, res: ParseResult):
         """Логика обработки XLSX-файлов с openpyxl, если Fuzzy не сработал."""
@@ -377,6 +345,69 @@ class ExcelParser:
                 return items
         return None
 
+    @staticmethod
+    def _build_item_from_row(item: dict, raw_row=None, sku_col_idx: Optional[int] = None) -> Optional[dict]:
+        """
+        Универсальная сборка item из сырых значений.
+        name и sku могут быть пустыми; если оба пустые -> вернуть None.
+        """
+
+        name = (item.get("name") or "").strip()
+        sku = (item.get("sku") or "").strip()
+
+        # базовая фильтрация: name и sku оба пустые -> не товар
+        if not name and not sku:
+            return None
+        if name and (len(name) < 3 or is_junk_row(name)):
+            # если name есть, но мусорный — считаем, что позиции нет
+            return None
+
+        # eд.измерения
+        unit: str = "шт"
+        unit_value: str = item.get("unit")
+        if unit_value:
+            unit = normalize_unit(str(unit_value).strip())
+
+        # цена (с защитой от спутывания с SKU
+        price_value = item.get("price")
+        parsed_price = parse_price(price_value) if price_value not in (None, "") else None
+
+        if parsed_price is not None and raw_row is not None and sku_col_idx is not None:
+            sku_raw = raw_row.iloc[sku_col_idx]
+            sku_value = str(sku_raw).strip() if not pd.isna(sku_raw) else ""
+
+            sku_clean = sku_value.replace("-", "").replace(" ", "")
+            try:
+                if sku_clean and str(int(parsed_price)) in sku_clean:
+                    price = 0.0
+                else:
+                    price = parsed_price
+            except ValueError:
+                price = parsed_price or 0.0
+        else:
+            price = parsed_price or 0.0
+
+        # производитель
+        manufacturer_value: str = item.get("manufacturer")
+        manufacturer = (manufacturer_value or "").strip()
+        if not manufacturer:
+            # если производитель пустой, пробуем определить по name
+            if name:
+                manufacturer = extract_vendor(name)
+
+        # примечания
+        notes = (item.get("notes") or "").strip()
+
+        item = {
+            "name": name,
+            "sku": sku,
+            "unit": unit,
+            "price": price,
+            "manufacturer": manufacturer,
+            "notes": notes,
+        }
+
+        return item
 
 parser = ExcelParser()
 
