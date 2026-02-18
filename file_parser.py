@@ -353,8 +353,6 @@ class ExcelParser:
 
         return None
 
-
-
     @staticmethod
     def _build_item(item: dict, raw_row=None, sku_col_idx: Optional[int] = None) -> Optional[dict]:
         """
@@ -418,6 +416,7 @@ class ExcelParser:
         }
 
         return item
+
 
 parser = ExcelParser()
 
