@@ -41,7 +41,7 @@ def match_header(row) -> dict | None:
         "name": [r"наименован", r"названи", r"товар", r"материал",
                  r"номенклатур", r"продукци", r"работ", r"^name$", r"product", r"item", r"имя"],
         "sku": [r"артикул", r"арт[\.\s]", r"код\s*товар", r"sku", r"^код$", r"article"],
-        "unit": [r"ед[\.\s]", r"единиц", r"unit", r"шт[\.\s", r"кг", r"м"],
+        "unit": [r"ед[\.\s]", r"единиц", r"unit", r"шт[\.\s]", r"кг", r"м", r"шт"],
         "price": [r"цена", r"стоимость", r"руб", r"₽", r"price", r"расценк"],
         "manufacturer": [r"производител", r"бренд", r"vendor", r"manufactur", r"поставщик"],
         "notes": [r"примечани", r"notes", r"описание", r"комментари"]
@@ -66,7 +66,8 @@ def match_header(row) -> dict | None:
             if any(re.search(pat, stripped) for pat in pats):
                 found[ftype] = i
                 break
-    return found if "name" in found and len(found) >= 2 else None
+
+    return found if len(found) >= 2 else None
 
 
 def normalize_unit(unit: str) -> str:
