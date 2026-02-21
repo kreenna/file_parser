@@ -6,9 +6,12 @@ from typing import Optional
 import pandas as pd
 import structlog
 from rapidfuzz import process, fuzz
+import openpyxl
 
 from metrics import quality, hash_file
-from utils import parse_price, normalize_unit, is_junk_row, extract_vendor, read_csv_iter, match_header
+from smart_reader import SmartSheet
+from utils import parse_price, normalize_unit, is_junk_row, extract_vendor, read_csv_iter, match_header, \
+    split_into_tables
 
 logger = structlog.get_logger()
 
@@ -103,36 +106,48 @@ class ExcelParser:
                         res.errors.append(f"{file_type}({sep}): {e}")
                         continue
             else:
-                # Excel-форматы: один reader, multi-sheet
-                print("Trying to parse excel")
+                # Excel-форматы: multi-sheet + merged cells
+                print("Trying to parse excel (smart)")
+
                 if file_type == ".xlsx":
                     fallback_method = self._standard_xlsx_fallback
                 elif file_type == ".xls":
                     fallback_method = self._standard_xls_fallback
 
-                xls = readers[0](str(file_path))  # pd.ExcelFile для xlsx/xls
-                sheet_items = []
+                wb = openpyxl.load_workbook(str(file_path), read_only=True, data_only=True, keep_links=False)
+                sheet_items: list[dict] = []
 
-                # проходимся по каждому листу
-                for sheet_name in xls.sheet_names:
-                    df = xls.parse(sheet_name=sheet_name, dtype=str)
-                    items, col_map = self._parse_dataframe_with_fuzzy(df)
+                for sheet_name in wb.sheetnames:
+                    ws = wb[sheet_name]
+                    smart = SmartSheet(ws)
+                    all_rows = smart.all_rows()
+                    if len(all_rows) < 2:
+                        continue
 
-                    if items:
-                        sheet_items.extend(items)
-                        if not res.col_map:
-                            res.col_map = col_map
+                    tables = split_into_tables(all_rows)
+
+                    # превращаем в df и используем fuzzy
+                    for start, end in tables:
+                        sub_rows = all_rows[start:end + 1]
+                        df = pd.DataFrame(sub_rows)
+                        items, col_map = self._parse_dataframe_with_fuzzy(df)
+                        if items:
+                            sheet_items.extend(items)
+                            if not res.col_map:
+                                res.col_map = col_map
+
+                wb.close()
 
                 if sheet_items:
-                    self._handle_success(res, sheet_items, None, "fuzzy")
-                    logger.info(f"fuzzy_ok_{file_type}", items=len(sheet_items), conf=f"{res.confidence:.2f}")
+                    self._handle_success(res, sheet_items, col_map, "fuzzy+merged")
+                    logger.info(f"fuzzy_merged_ok_{file_type}", items=len(sheet_items), conf=f"{res.confidence:.2f}")
                     return
 
         except Exception as e:
             res.errors.append(f"fuzzy_{file_type}: {e}")
             logger.warning(f"fuzzy_{file_type}_failed", error=str(e))
 
-        fallback_method(file_path, res)  # _standard_xlsx_fallback или _standard_csv_fallback
+        fallback_method(file_path, res)   # _standard_xlsx_fallback или _standard_csv_fallback
 
     # основной путь: pandas + fuzzy
 
@@ -174,14 +189,16 @@ class ExcelParser:
 
                 if match and match[1] > best_score:
                     best_score = match[1]
-                best_idx = match[2]
-                if best_score >= 70:
-                    col_map[col_type] = best_idx
+                    best_idx = match[2]
+
+            if best_idx and best_score >= 70:
+                col_map[col_type] = best_idx
 
         if "name" not in col_map and "sku" not in col_map:
             return [], col_map
 
         items: list[dict] = []
+        current_section = ""
 
         for _, row in data.iterrows():
             name_value = None
@@ -205,15 +222,28 @@ class ExcelParser:
                 notes_value = row.iloc[col_map["notes"]]
 
             item_values: dict = {
-                "name_value": str(name_value) if name_value and not pd.isna(name_value) else "",
-                "sku_value": str(sku_value) if sku_value and not pd.isna(sku_value) else "",
-                "unit_value": str(unit_value) if unit_value and not pd.isna(unit_value) else None,
-                "price_value": price_value,
-                "manufacturer_value": manufacturer_value,
-                "notes_value": notes_value
+                "name": str(name_value) if name_value and not pd.isna(name_value) else "",
+                "sku": str(sku_value) if sku_value and not pd.isna(sku_value) else "",
+                "unit": str(unit_value) if unit_value and not pd.isna(unit_value) else None,
+                "price": price_value,
+                "manufacturer": manufacturer_value,
+                "notes": notes_value if notes_value != name_value else ""
             }
 
             item = ExcelParser._build_item(item_values, raw_row=row, sku_col_idx=col_map.get("sku"))
+
+            has_price = item["price"] > 0
+            has_sku = bool(item["sku"])
+
+            if not has_sku and not has_price:
+                # treat as section header
+                if item["name"]:
+                    current_section = item["name"]
+                continue
+
+            # normal item
+            item["section"] = current_section
+            items.append(item)
 
             if item:
                 items.append(item)
@@ -236,7 +266,6 @@ class ExcelParser:
 
         try:
             print("trying excel fallback")
-            import openpyxl
             wb = openpyxl.load_workbook(str(p), read_only=True, data_only=True)
             for sn in wb.sheetnames:
                 rows = list(wb[sn].iter_rows(values_only=True))
@@ -316,22 +345,22 @@ class ExcelParser:
                 manufacturer_value = None
                 notes_value = None
 
-                if col_name < len(dr) or dr[col_name]:
+                if col_name is not None and col_name < len(dr):
                     name_value = dr[col_name]
 
-                if col_sku and col_sku < len(dr):
+                if col_sku is not None and col_sku < len(dr):
                     sku_value = dr[col_sku]
 
-                if col_unit and col_unit < len(dr):
+                if col_unit is not None and col_unit < len(dr):
                     unit_value = dr[col_unit]
 
-                if col_price and col_price < len(dr):
+                if col_price is not None and col_price < len(dr):
                     price_value = dr[col_price]
 
-                if col_manufacturer and col_manufacturer < len(dr):
+                if col_manufacturer is not None and col_manufacturer < len(dr):
                     manufacturer_value = dr[col_manufacturer]
 
-                if col_notes and col_notes < len(dr):
+                if col_notes is not None and col_notes < len(dr):
                     notes_value = dr[col_notes]
 
                 item_values: dict = {
@@ -360,29 +389,32 @@ class ExcelParser:
         name и sku могут быть пустыми; если оба пустые -> вернуть None.
         """
 
-        name = item.get("name")
-        sku = item.get("sku")
+        name = item.get("name") or ""
+        sku = item.get("sku") or ""
 
-        # базовая фильтрация: name и sku оба пустые -> не товар
+        # вызов ИИ для поиска данных
         if not name and not sku:
+            # TODO: call AI here later to guess name/sku from raw_row
+            # ai_name, ai_sku = self._ai_guess_item(raw_row)
+            # if ai_name or ai_sku: reuse builder
             return None
         if name and (len(name) < 3 or is_junk_row(name)):
             # если name есть, но мусорный — считаем, что позиции нет
             return None
 
         # eд.измерения
-        unit: str = "шт"
+        unit: str = ""
         unit_value: str = item.get("unit")
         if unit_value:
             unit = normalize_unit(str(unit_value).strip())
 
         # цена (с защитой от спутывания с SKU
         price_value = item.get("price")
-        parsed_price = parse_price(price_value) if price_value else None
+        parsed_price = parse_price(price_value) if price_value not in (None, "") else None
 
-        if parsed_price and raw_row and sku_col_idx:
+        if all(x is not None for x in (parsed_price, raw_row, sku_col_idx)):
             sku_raw = raw_row.iloc[sku_col_idx]
-            sku_value = str(sku_raw).strip() if not pd.isna(sku_raw) else ""
+            sku_value = str(sku_raw) if not pd.isna(sku_raw) else ""
 
             sku_clean = sku_value.replace("-", "").replace(" ", "")
             try:
@@ -404,7 +436,10 @@ class ExcelParser:
                 manufacturer = extract_vendor(name)
 
         # примечания
-        notes = (item.get("notes") or "").strip()
+        notes = item.get("notes") if item.get("notes") and not pd.isna(item.get("notes")) else ""
+
+        if not any([unit, price, manufacturer, notes]):
+            return None
 
         item = {
             "name": name,
@@ -420,5 +455,5 @@ class ExcelParser:
 
 parser = ExcelParser()
 
-result = parser.parse_file(os.path.join("test-files", "1.Спецификация (Гибрид)  1АПС д.1 — копия.xlsx"))
+result = parser.parse_file(os.path.join("test-files", "V3.7 Шаблон ТКП апрель.xlsx"))
 print(result)

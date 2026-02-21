@@ -34,40 +34,35 @@ def parse_price(value) -> float | None:
         return None
 
 
-def match_header(row) -> dict | None:
-    """Проверка на соответствие названиям шапки."""
+SIMPLE_HEADER_KEYWORDS = {
+    "name": ["наименован", "назван", "товар", "позици", "description", "item", "product"],
+    "sku": ["артикул", "арт", "код", "sku", "article"],
+    "unit": ["ед", "ед. изм", "единиц", "unit", "шт", "кг", "м"],
+    "price": ["цена", "стоим", "руб", "₽", "price"],
+    "manufacturer": ["производ", "бренд", "vendor", "manufacturer", "поставщик"],
+    "notes": ["примечан", "коммент", "notes", "описан", "description"],
+}
 
-    COLUMN_PATTERNS = {
-        "name": [r"наименован", r"названи", r"товар", r"материал",
-                 r"номенклатур", r"продукци", r"работ", r"^name$", r"product", r"item", r"имя"],
-        "sku": [r"артикул", r"арт[\.\s]", r"код\s*товар", r"sku", r"^код$", r"article"],
-        "unit": [r"ед[\.\s]", r"единиц", r"unit", r"шт[\.\s]", r"кг", r"м", r"шт"],
-        "price": [r"цена", r"стоимость", r"руб", r"₽", r"price", r"расценк"],
-        "manufacturer": [r"производител", r"бренд", r"vendor", r"manufactur", r"поставщик"],
-        "notes": [r"примечани", r"notes", r"описание", r"комментари"]
-    }
-
-    if not row:
-        return None
-
-    found: dict[str, int] = {}
-
-    for i, value in enumerate(row):
-        if value is None:
+def simple_match_header(row) -> dict[str, int]:
+    """
+    Очень простой матчинг заголовка по подстрокам.
+    Возвращает col_map: {\"name\": idx, ...}.
+    """
+    col_map: dict[str, int] = {}
+    for idx, val in enumerate(row):
+        if val is None:
             continue
-
-        stripped = str(value).lower().strip()
-
-        if not stripped or len(stripped) > 200:
+        text = str(val).strip().lower()
+        if not text or len(text) > 100:
             continue
-        for ftype, pats in COLUMN_PATTERNS.items():
-            if ftype in found:
+        for col_type, keywords in SIMPLE_HEADER_KEYWORDS.items():
+            if col_type in col_map:
                 continue
-            if any(re.search(pat, stripped) for pat in pats):
-                found[ftype] = i
-                break
-
-    return found if len(found) >= 2 else None
+            for kw in keywords:
+                if kw in text:
+                    col_map[col_type] = idx
+                    break
+    return col_map
 
 
 def normalize_unit(unit: str) -> str:
@@ -75,7 +70,7 @@ def normalize_unit(unit: str) -> str:
 
     unit = unit.lower().strip()
     if not unit:
-        return "шт"
+        return ""
     mapping = {
         "шт": ["шт", "штука", "штук"],
         "м": ["м", "метр", "метра", "метров"],
@@ -119,3 +114,36 @@ def extract_vendor(name: str) -> str:
 def read_csv_iter(path: str, sep: str):
     """Итератор для CSV, возвращает df (для совместимости с multi-sheet логикой)."""
     yield pd.read_csv(path, sep=sep, dtype=str)
+
+
+def split_into_tables(all_rows: list[list], min_non_empty_cells: int = 2) -> list[tuple[int, int]]:
+    """
+    Возвращает список (start_row, end_row) для блоков таблиц.
+    Разделитель: 2+ подряд строк, где < min_non_empty_cells непустых ячеек.
+    Индексы 0-based по all_rows.
+    """
+    tables = []
+    cur_start = None
+    empty_count = 0
+
+    for row_id, row in enumerate(all_rows):
+        non_empty = sum(1 for value in row if value not in (None, "") and str(value).strip())
+        if non_empty >= min_non_empty_cells:
+            if cur_start is None:
+                cur_start = row_id
+            empty_count = 0
+        else:
+            empty_count += 1
+            if empty_count >= 2 and cur_start is not None:
+                end = row_id - empty_count
+                if end - cur_start >= 2:
+                    tables.append((cur_start, end))
+                cur_start = None
+
+    if cur_start is not None and len(all_rows) - 1 - cur_start >= 2:
+        tables.append((cur_start, len(all_rows) - 1))
+
+    if not tables:
+        tables = [(0, len(all_rows) - 1)]
+
+    return tables
