@@ -3,12 +3,15 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Optional
 
+import openpyxl
 import pandas as pd
 import structlog
 from rapidfuzz import process, fuzz
 
 from metrics import quality, hash_file
-from utils import parse_price, normalize_unit, is_junk_row, read_csv_iter, simple_match_header
+from smart_reader import SmartSheet
+from utils import parse_price, normalize_unit, is_junk_row, read_csv_iter, simple_match_header, build_multirow_header, \
+    detect_header_block
 
 # extract vendor to be fixed
 
@@ -70,7 +73,7 @@ class ExcelParser:
 
     # XLSX / XLS
 
-    def _parse_spreadsheet(self, file_path: Path, res: ParseResult, readers: list, fallback_method: callable = None):
+    def _parse_spreadsheet(self, file_path: Path, res: ParseResult, fallback_method: callable = None):
         """Универсальный парсер для spreadsheet-форматов (xlsx, xls, csv)."""
 
         file_type: str = file_path.suffix.lower()
@@ -112,20 +115,29 @@ class ExcelParser:
                 elif file_type == ".xls":
                     fallback_method = self._standard_xls_fallback
 
-                xls = readers[0](str(file_path))  # pd.ExcelFile для xlsx/xls
+                wb = openpyxl.load_workbook(str(file_path), read_only=True, data_only=True)
+                print("wb good")
                 sheet_items = []
 
                 # проходимся по каждому листу
-                for sheet_name in xls.sheet_names:
-                    df = xls.parse(sheet_name=sheet_name, dtype=str)
-                    print("yes df")
-                    items, col_map = self._parse_dataframe_with_fuzzy(df)
-                    print("yes fuzzy")
+                for sheet_name in wb.sheetnames:
+                    smart = SmartSheet(wb[sheet_name])
+                    print("smart good")
+                    rows = smart.all_rows()
+                    print("smart rows good")
+                    if not rows:
+                        continue
+                    df = pd.DataFrame(rows, dtype=str)
+                    print("df good")
 
+                    items, col_map = self._parse_dataframe_with_fuzzy(df)
+                    print("fuzzy good")
                     if items:
                         sheet_items.extend(items)
                         if not res.col_map:
                             res.col_map = col_map
+
+                wb.close()
 
                 if sheet_items:
                     self._handle_success(res, sheet_items, {}, "fuzzy")
@@ -147,40 +159,45 @@ class ExcelParser:
         if df.empty:
             return [], {}
 
-        # ищем строку шапки: первая строка, где есть >=2 ячейки с буквами
-        header_row = 0
-        while header_row < len(df) and df.iloc[header_row].astype(str).str.contains(r"[а-яa-z]", case=False, regex=True,
-                                                                                    na=False).sum() < 2:
-            header_row += 1
+        # 1) detect header block (flexible position and height)
+        header_rows, data_start = detect_header_block(df, max_scan_rows=30, max_header_block_height=5)
+        print(header_rows, data_start)
+        # header_rows could be [11, 12]; data_start will be 13.
 
-        headers = df.iloc[header_row].astype(str)
-        data = df.iloc[header_row + 1:].reset_index(drop=True)
+        # 2) build combined headers from those rows
+        data, headers = build_multirow_header(df, header_rows, data_start_index=data_start)
+        print(data, headers)
 
+        print("we got here")
         COLUMN_KEYWORDS = {
             "name": ["наименовани", "названи", "товар", "позици", "материал", "product", "item", "имя",
                      "название товара", "материал", "номенклатур"],
             "sku": ["артикул", "арт", "код", "sku", "article"],
-            "unit": ["ед. измерения", "единица измерения", "unit", "шт.", "кг", "м."],
+            "unit": ["ед. измерения", "единица измерения", "unit", "шт.", "кг", "м.", "ед.изм"],
             "price": ["цена", "стоимость", "руб", "₽", "price", "расценк"],
             "manufacturer": ["производител", "бренд", "vendor", "manufacturer", "поставщик"],
             "notes": ["примечани", "notes", "описание", "комментари"]
         }
 
         col_map: dict[str, int] = {}
-
+        headers_list = [str(h) for h in headers]
+        print(headers, data)
         for col_type, keywords in COLUMN_KEYWORDS.items():
             best_score = 0
             best_idx = None
 
             # проверяем совпадения по каждому слову и определяем лучшее
             for keyword in keywords:
-                match = process.extractOne(keyword, headers.astype(str).tolist(), scorer=fuzz.partial_ratio)
+                print("matching")
+                match = process.extractOne(keyword, headers_list, scorer=fuzz.partial_ratio)
+                print("matched")
 
                 if match and match[1] > best_score:
+                    print("match made")
                     best_score = match[1]
                     best_idx = match[2]
 
-            if best_idx and best_score >= 70:
+            if best_idx is not None and best_score >= 70:
                 col_map[col_type] = best_idx
 
         if "name" not in col_map and "sku" not in col_map:
@@ -189,36 +206,19 @@ class ExcelParser:
         items: list[dict] = []
 
         for _, row in data.iterrows():
-            name_value = None
-            sku_value = None
-            unit_value = None
-            price_value = None
-            manufacturer_value = None
-            notes_value = None
-
-            if "name" in col_map:
-                name_value = row.iloc[col_map["name"]]
-            if "sku" in col_map:
-                sku_value = row.iloc[col_map["sku"]]
-            if "unit" in col_map:
-                unit_value = row.iloc[col_map["unit"]]
-            if "price" in col_map:
-                price_value = row.iloc[col_map["price"]]
-            if "manufacturer" in col_map:
-                manufacturer_value = row.iloc[col_map["manufacturer"]]
-            if "notes" in col_map:
-                notes_value = row.iloc[col_map["notes"]]
 
             item_values: dict = {
-                "name": str(name_value) if name_value and not pd.isna(name_value) else "",
-                "sku": str(sku_value) if sku_value and not pd.isna(sku_value) else "",
-                "unit": str(unit_value) if unit_value and not pd.isna(unit_value) else None,
-                "price": price_value,
-                "manufacturer": manufacturer_value,
-                "notes": notes_value if notes_value != name_value else ""
+                "name": str(row.iloc[col_map.get("name")]).strip() or "",
+                "sku": str(row.iloc[col_map.get("sku")]).strip() or "",
+                "unit": str(row.iloc[col_map.get("unit")]).strip() or "",
+                "price": float(row.iloc[col_map.get("price")]) or 0.0,  # Handles NaN as 0.0
+                "manufacturer": str(row.iloc[col_map.get("manufacturer")]).strip() or "",
+                "notes": str(row.iloc[col_map.get("notes")]) if row.iloc[col_map.get("notes")] != row.iloc[
+                    col_map.get("notes")] else ""
             }
 
             item = ExcelParser._build_item(item_values, raw_row=row, sku_col_idx=col_map.get("sku"))
+            print("we made item")
             if item:
                 items.append(item)
 
@@ -417,8 +417,8 @@ class ExcelParser:
         # производитель
         manufacturer = safe_extract(item_values.get("manufacturer", ""))
         # if not manufacturer and name: (needs to be fixed)
-            # если производитель пустой, пробуем определить по name
-            # manufacturer = extract_vendor(name)
+        # если производитель пустой, пробуем определить по name
+        # manufacturer = extract_vendor(name)
 
         # примечания
         notes = safe_extract(item_values.get("notes", ""))
@@ -436,3 +436,9 @@ class ExcelParser:
         }
 
         return item
+
+
+parser = ExcelParser()
+
+result = parser.parse_file(os.path.join("test-files", "V3.7 Шаблон ТКП апрель.xlsx"))
+print(result)
