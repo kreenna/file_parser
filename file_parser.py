@@ -1,4 +1,3 @@
-import os
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Optional
@@ -46,7 +45,7 @@ class ExcelParser:
 
         # пробуем парсить файл в зависимости от его формата
         try:
-            print("Trying to parse")
+
             file_type = p.suffix.lower()
 
             if file_type in (".xlsx", ".xlsm", ".xls"):
@@ -61,7 +60,6 @@ class ExcelParser:
             res.needs_ai = (res.confidence < AI_FALLBACK_THRESHOLD or not res.items)
 
         except Exception as e:
-            print("Failed to parse")
             logger.error("parse_error", file=str(p), error=str(e))
             res.errors.append(str(e))
             res.needs_ai = True
@@ -106,7 +104,7 @@ class ExcelParser:
                         continue
             else:
                 # Excel-форматы: один reader, multi-sheet
-                print("Trying to parse excel")
+
                 if file_type == ".xlsx":
                     fallback_method = self._standard_xlsx_fallback
                 elif file_type == ".xls":
@@ -117,10 +115,8 @@ class ExcelParser:
 
                 # проходимся по каждому листу
                 for sheet_name in xls.sheet_names:
-                    df = xls.parse(sheet_name=sheet_name, dtype=str)
-                    print("yes df")
+                    df = xls.parse(sheet_name=sheet_name, dtype=str, header=None)
                     items, col_map = self._parse_dataframe_with_fuzzy(df)
-                    print("yes fuzzy")
 
                     if items:
                         sheet_items.extend(items)
@@ -148,7 +144,7 @@ class ExcelParser:
             return [], {}
 
         # ищем строку шапки: первая строка, где есть >=2 ячейки с буквами
-        header_row = 0
+        header_row: int = 0
         while header_row < len(df) and df.iloc[header_row].astype(str).str.contains(r"[а-яa-z]", case=False, regex=True,
                                                                                     na=False).sum() < 2:
             header_row += 1
@@ -157,30 +153,30 @@ class ExcelParser:
         data = df.iloc[header_row + 1:].reset_index(drop=True)
 
         COLUMN_KEYWORDS = {
-            "name": ["наименовани", "названи", "товар", "позици", "материал", "product", "item", "имя",
-                     "название товара", "материал", "номенклатур"],
+            "name": ["наименовани", "названи", "product", "item", "имя", "название товара", "номенклатур"],
             "sku": ["артикул", "арт", "код", "sku", "article"],
-            "unit": ["ед. измерения", "единица измерения", "unit", "шт.", "кг", "м."],
-            "price": ["цена", "стоимость", "руб", "₽", "price", "расценк"],
+            "unit": ["ед. измерения", "единица измерения", "unit", "ед. изм"],
+            "price": ["цена", "стоимость", "price", "расценк"],
             "manufacturer": ["производител", "бренд", "vendor", "manufacturer", "поставщик"],
             "notes": ["примечани", "notes", "описание", "комментари"]
         }
 
         col_map: dict[str, int] = {}
+        headers_list: list = headers.astype(str).tolist()
 
         for col_type, keywords in COLUMN_KEYWORDS.items():
+
             best_score = 0
             best_idx = None
 
             # проверяем совпадения по каждому слову и определяем лучшее
             for keyword in keywords:
-                match = process.extractOne(keyword, headers.astype(str).tolist(), scorer=fuzz.partial_ratio)
+                match = process.extractOne(keyword, headers_list, scorer=fuzz.partial_ratio)
 
                 if match and match[1] > best_score:
                     best_score = match[1]
                     best_idx = match[2]
-
-            if best_idx and best_score >= 70:
+            if best_idx is not None and best_score >= 70:
                 col_map[col_type] = best_idx
 
         if "name" not in col_map and "sku" not in col_map:
@@ -219,6 +215,7 @@ class ExcelParser:
             }
 
             item = ExcelParser._build_item(item_values, raw_row=row, sku_col_idx=col_map.get("sku"))
+
             if item:
                 items.append(item)
 
@@ -239,7 +236,6 @@ class ExcelParser:
         """Логика обработки XLSX-файлов с openpyxl, если Fuzzy не сработал."""
 
         try:
-            print("trying excel fallback")
             import openpyxl
             wb = openpyxl.load_workbook(str(p), read_only=True, data_only=True)
             for sn in wb.sheetnames:
@@ -417,8 +413,8 @@ class ExcelParser:
         # производитель
         manufacturer = safe_extract(item_values.get("manufacturer", ""))
         # if not manufacturer and name: (needs to be fixed)
-            # если производитель пустой, пробуем определить по name
-            # manufacturer = extract_vendor(name)
+        # если производитель пустой, пробуем определить по name
+        # manufacturer = extract_vendor(name)
 
         # примечания
         notes = safe_extract(item_values.get("notes", ""))
