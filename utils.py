@@ -1,4 +1,5 @@
 import re
+from typing import Optional
 
 import pandas as pd
 
@@ -38,7 +39,16 @@ SIMPLE_HEADER_KEYWORDS = {
     "name": ["наименован", "назван", "товар", "позици", "description", "item", "product"],
     "sku": ["артикул", "арт", "код", "sku", "article"],
     "unit": ["ед", "ед. изм", "ед.изм", "единиц", "unit", "изм"],
-    "price": ["цена", "стоим", "руб", "₽", "price"],
+    "quantity": ["количество", "кол-во", "кол."],
+    "price_unit": ["цена", "стоимость", "price", "расценк"],
+    # explicit “без НДС”
+    "price_base": ["цена без ндс", "без ндс", "без НДС", "цена за ед без ндс"],
+    # explicit “с НДС”
+    "price_vat": ["цена с ндс", "с НДС", "вкл. НДС", "цена с учетом ндс"],
+    # totals
+    "total_no_vat": ["стоимость без ндс", "сумма без ндс", "итого без ндс"],
+    "total_vat": ["стоимость с ндс", "сумма с ндс", "итого с ндс"],
+    "total": ["стоимость", "сумма", "итого", "всего", "total", "amount"],
     "manufacturer": ["производ", "бренд", "vendor", "manufacturer", "поставщик"],
     "notes": ["примечан", "коммент", "notes", "описан", "description"],
 }
@@ -117,3 +127,69 @@ def extract_vendor(name: str) -> str:
 def read_csv_iter(path: str, sep: str):
     """Итератор для CSV, возвращает df (для совместимости с multi-sheet логикой)."""
     yield pd.read_csv(path, sep=sep, dtype=str)
+
+
+def collect_prices_for_row(row, col_map: dict) -> dict:
+    """
+    Собирает все найденные ценовые значения по типам:
+    price_base, price_unit, price_vat, total_no_vat, total_vat, total.
+    """
+
+    price_cols = ["price_base", "price_unit", "price_vat", "total_no_vat", "total_vat", "total"]
+    prices = {}
+
+    for key in price_cols:
+        print(f"key: {key}")
+        idx: int = col_map.get(key)
+        print(idx)
+        if idx is None or idx >= len(row):
+            print("going on")
+            continue
+        print(row)
+        value = row[idx] if isinstance(row, tuple) else row.iloc[idx]
+        print(f"value {value}")
+        price = parse_price(value) if value else 0.0
+        if price is not None and price > 0:
+            print(f"price: {price}")
+            prices[key] = price
+            print(f"prices: {prices}")
+
+    print(f"prices haha")
+    return prices
+
+
+def pick_best_price(prices: dict, quantity: float | None = None, vat_rate: Optional[float] = 0.2) -> float:
+    """
+    Выбирает лучшую ЦЕНУ ЗА ЕДИНИЦУ без НДС.
+    Приоритет:
+      1) price_base
+      2) price_unit
+      3) price_vat / 1.2
+      4) total_no_vat / quantity
+      5) total / quantity
+      6) total_vat / quantity / 1.2
+    """
+
+    if "price_base" in prices:
+        return prices["price_base"]
+
+    if "price_unit" in prices:
+        return prices["price_unit"]
+
+    if "price_vat" in prices:
+        return prices["price_vat"] / (1 + vat_rate)
+
+    if quantity and quantity > 0:
+        if "total_no_vat" in prices:
+            return prices["total_no_vat"] / quantity
+        if "total" in prices:
+            return prices["total"] / quantity
+        if "total_vat" in prices:
+            return prices["total_vat"] / quantity / (1 + vat_rate)
+
+    # fallback: any total if quantity unknown
+    for key in ["total_no_vat", "total", "total_vat"]:
+        if key in prices:
+            return prices[key]
+
+    return 0.0

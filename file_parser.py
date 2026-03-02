@@ -1,4 +1,4 @@
-import os
+from dataclasses import dataclass, field
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Optional
@@ -8,7 +8,8 @@ import structlog
 from rapidfuzz import process, fuzz
 
 from metrics import quality, hash_file
-from utils import parse_price, normalize_unit, is_junk_row, read_csv_iter, simple_match_header
+from utils import parse_price, normalize_unit, is_junk_row, read_csv_iter, simple_match_header, collect_prices_for_row, \
+    pick_best_price
 
 # extract vendor to be fixed
 
@@ -46,7 +47,7 @@ class ExcelParser:
 
         # пробуем парсить файл в зависимости от его формата
         try:
-            print("Trying to parse")
+
             file_type = p.suffix.lower()
 
             if file_type in (".xlsx", ".xlsm", ".xls"):
@@ -61,7 +62,6 @@ class ExcelParser:
             res.needs_ai = (res.confidence < AI_FALLBACK_THRESHOLD or not res.items)
 
         except Exception as e:
-            print("Failed to parse")
             logger.error("parse_error", file=str(p), error=str(e))
             res.errors.append(str(e))
             res.needs_ai = True
@@ -106,7 +106,7 @@ class ExcelParser:
                         continue
             else:
                 # Excel-форматы: один reader, multi-sheet
-                print("Trying to parse excel")
+
                 if file_type == ".xlsx":
                     fallback_method = self._standard_xlsx_fallback
                 elif file_type == ".xls":
@@ -117,10 +117,8 @@ class ExcelParser:
 
                 # проходимся по каждому листу
                 for sheet_name in xls.sheet_names:
-                    df = xls.parse(sheet_name=sheet_name, dtype=str)
-                    print("yes df")
+                    df = xls.parse(sheet_name=sheet_name, dtype=str, header=None)
                     items, col_map = self._parse_dataframe_with_fuzzy(df)
-                    print("yes fuzzy")
 
                     if items:
                         sheet_items.extend(items)
@@ -128,7 +126,7 @@ class ExcelParser:
                             res.col_map = col_map
 
                 if sheet_items:
-                    self._handle_success(res, sheet_items, {}, "fuzzy")
+                    self._handle_success(res, sheet_items, col_map, "fuzzy")
                     logger.info(f"fuzzy_ok_{file_type}", items=len(sheet_items), conf=f"{res.confidence:.2f}")
                     return
 
@@ -148,7 +146,7 @@ class ExcelParser:
             return [], {}
 
         # ищем строку шапки: первая строка, где есть >=2 ячейки с буквами
-        header_row = 0
+        header_row: int = 0
         while header_row < len(df) and df.iloc[header_row].astype(str).str.contains(r"[а-яa-z]", case=False, regex=True,
                                                                                     na=False).sum() < 2:
             header_row += 1
@@ -157,68 +155,72 @@ class ExcelParser:
         data = df.iloc[header_row + 1:].reset_index(drop=True)
 
         COLUMN_KEYWORDS = {
-            "name": ["наименовани", "названи", "товар", "позици", "материал", "product", "item", "имя",
-                     "название товара", "материал", "номенклатур"],
+            "name": ["наименовани", "названи", "product", "item", "имя", "название товара", "номенклатур"],
             "sku": ["артикул", "арт", "код", "sku", "article"],
-            "unit": ["ед. измерения", "единица измерения", "unit", "шт.", "кг", "м."],
-            "price": ["цена", "стоимость", "руб", "₽", "price", "расценк"],
+            "unit": ["ед. измерения", "единица измерения", "unit", "ед. изм"],
+            "quantity": ["количество", "кол-во", "кол."],
+            # unit price (generic)
+            "price_unit": ["цена", "стоимость", "price", "расценк"],
+            # explicit “без НДС”
+            "price_base": ["цена без ндс", "без ндс", "без НДС", "цена за ед без ндс"],
+            # explicit “с НДС”
+            "price_vat": ["цена с ндс", "с НДС", "вкл. НДС", "цена с учетом ндс"],
+            # totals
+            "total_no_vat": ["стоимость без ндс", "сумма без ндс", "итого без ндс"],
+            "total_vat": ["стоимость с ндс", "сумма с ндс", "итого с ндс"],
+            "total": ["стоимость", "сумма", "итого", "всего", "total", "amount"],
             "manufacturer": ["производител", "бренд", "vendor", "manufacturer", "поставщик"],
             "notes": ["примечани", "notes", "описание", "комментари"]
         }
 
         col_map: dict[str, int] = {}
+        headers_list: list = headers.astype(str).tolist()
 
         for col_type, keywords in COLUMN_KEYWORDS.items():
+
             best_score = 0
             best_idx = None
 
             # проверяем совпадения по каждому слову и определяем лучшее
             for keyword in keywords:
-                match = process.extractOne(keyword, headers.astype(str).tolist(), scorer=fuzz.partial_ratio)
+                match = process.extractOne(keyword, headers_list, scorer=fuzz.partial_ratio)
 
                 if match and match[1] > best_score:
                     best_score = match[1]
                     best_idx = match[2]
-
-            if best_idx and best_score >= 70:
+            if best_idx is not None and best_score >= 70:
                 col_map[col_type] = best_idx
 
         if "name" not in col_map and "sku" not in col_map:
             return [], col_map
 
         items: list[dict] = []
-
         for _, row in data.iterrows():
-            name_value = None
-            sku_value = None
-            unit_value = None
-            price_value = None
-            manufacturer_value = None
-            notes_value = None
+            name_value = row.iloc[col_map["name"]] if "name" in col_map else ""
+            sku_value = row.iloc[col_map["sku"]] if "sku" in col_map else ""
+            unit_value = row.iloc[col_map["unit"]] if "unit" in col_map else ""
+            manufacturer_value = row.iloc[col_map["manufacturer"]] if "manufacturer" in col_map else ""
+            notes_value = row.iloc[col_map["notes"]] if "notes" in col_map else ""
 
-            if "name" in col_map:
-                name_value = row.iloc[col_map["name"]]
-            if "sku" in col_map:
-                sku_value = row.iloc[col_map["sku"]]
-            if "unit" in col_map:
-                unit_value = row.iloc[col_map["unit"]]
-            if "price" in col_map:
-                price_value = row.iloc[col_map["price"]]
-            if "manufacturer" in col_map:
-                manufacturer_value = row.iloc[col_map["manufacturer"]]
-            if "notes" in col_map:
-                notes_value = row.iloc[col_map["notes"]]
+            prices = collect_prices_for_row(row, col_map)
+
+            quantity_value = row.iloc[col_map["quantity"]] if "quantity" in col_map else 0
+            quantity = parse_price(quantity_value) or 0
+
+            best_price = pick_best_price(prices, quantity or 0)
 
             item_values: dict = {
                 "name": str(name_value) if name_value and not pd.isna(name_value) else "",
                 "sku": str(sku_value) if sku_value and not pd.isna(sku_value) else "",
                 "unit": str(unit_value) if unit_value and not pd.isna(unit_value) else None,
-                "price": price_value,
+                "quantity": quantity,
+                "price": best_price,
                 "manufacturer": manufacturer_value,
                 "notes": notes_value if notes_value != name_value else ""
             }
 
             item = ExcelParser._build_item(item_values, raw_row=row, sku_col_idx=col_map.get("sku"))
+
             if item:
                 items.append(item)
 
@@ -239,7 +241,6 @@ class ExcelParser:
         """Логика обработки XLSX-файлов с openpyxl, если Fuzzy не сработал."""
 
         try:
-            print("trying excel fallback")
             import openpyxl
             wb = openpyxl.load_workbook(str(p), read_only=True, data_only=True)
             for sn in wb.sheetnames:
@@ -301,14 +302,14 @@ class ExcelParser:
             col_map = simple_match_header(row)
             # нужен хотя бы name или sku, плюс какой-то доп. столбец
             has_id = ("name" in col_map) or ("sku" in col_map)
-            has_any_extra = any(k in col_map for k in ["unit", "price", "manufacturer", "notes"])
+            has_any_extra = any(k in col_map for k in ["unit", "quantity", "manufacturer", "notes"])
             if not has_id or not has_any_extra:
                 continue
 
             col_name = col_map.get("name")
             col_sku = col_map.get("sku")
             col_unit = col_map.get("unit")
-            col_price = col_map.get("price")
+            col_quantity = col_map.get("quantity")
             col_manufacturer = col_map.get("manufacturer")
             col_notes = col_map.get("notes")
 
@@ -316,37 +317,27 @@ class ExcelParser:
 
             for dr in rows[row_id + 1:]:
                 # обозначаем переменные
-                name_value = None
-                sku_value = None
-                unit_value = None
-                price_value = None
-                manufacturer_value = None
-                notes_value = None
+                name_value = dr[col_name] if col_name is not None and col_name < len(dr) else ""
+                sku_value = dr[col_sku] if col_sku is not None and col_sku < len(dr) else ""
+                unit_value = dr[col_unit] if col_unit is not None and col_unit < len(dr) else ""
+                manufacturer_value = dr[col_manufacturer] if col_manufacturer is not None and col_manufacturer < len(
+                    dr) else ""
+                notes_value = dr[col_notes] if col_notes is not None and col_notes < len(dr) else ""
 
-                if col_name is not None and col_name < len(dr):
-                    name_value = dr[col_name]
+                quantity_value = dr[col_quantity] if col_quantity is not None and col_quantity < len(dr) else 0
+                quantity = parse_price(quantity_value) or 0
 
-                if col_sku is not None and col_sku < len(dr):
-                    sku_value = dr[col_sku]
+                prices: dict = collect_prices_for_row(dr, col_map)
 
-                if col_unit is not None and col_unit < len(dr):
-                    unit_value = dr[col_unit]
-
-                if col_price is not None and col_price < len(dr):
-                    price_value = dr[col_price]
-
-                if col_manufacturer is not None and col_manufacturer < len(dr):
-                    manufacturer_value = dr[col_manufacturer]
-
-                if col_notes is not None and col_notes < len(dr):
-                    notes_value = dr[col_notes]
+                best_price = pick_best_price(prices, quantity or 0)
 
                 item_values: dict = {
                     "name": str(name_value) if name_value and not pd.isna(name_value) else "",
                     "sku": str(sku_value) if sku_value and not pd.isna(sku_value) else "",
                     "unit": str(unit_value) if unit_value and not pd.isna(unit_value) else None,
-                    "price": price_value,
-                    "manufacturer": manufacturer_value,
+                    "quantity": int(quantity_value) if quantity_value and not pd.isna(quantity_value) else 0,
+                    "price": best_price,
+                    "manufacturer": manufacturer_value if manufacturer_value and not pd.isna(manufacturer_value) else 0,
                     "notes": notes_value if notes_value != name_value else ""
                 }
 
@@ -392,6 +383,8 @@ class ExcelParser:
         unit_value: str = item_values.get("unit")
         unit = normalize_unit(safe_extract(unit_value)) if unit_value else ""
 
+        quantity = safe_extract(item_values.get("quantity", ""))
+
         # цена (с защитой от спутывания с SKU
         price_value = item_values.get("price")
         # parsed price does not parse correctly because of the multi-headers
@@ -417,8 +410,8 @@ class ExcelParser:
         # производитель
         manufacturer = safe_extract(item_values.get("manufacturer", ""))
         # if not manufacturer and name: (needs to be fixed)
-            # если производитель пустой, пробуем определить по name
-            # manufacturer = extract_vendor(name)
+        # если производитель пустой, пробуем определить по name
+        # manufacturer = extract_vendor(name)
 
         # примечания
         notes = safe_extract(item_values.get("notes", ""))
@@ -430,6 +423,7 @@ class ExcelParser:
             "name": name,
             "sku": sku,
             "unit": unit,
+            "quantity": quantity,
             "price": price,
             "manufacturer": manufacturer,
             "notes": notes,
