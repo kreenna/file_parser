@@ -139,22 +139,16 @@ def collect_prices_for_row(row, col_map: dict) -> dict:
     prices = {}
 
     for key in price_cols:
-        print(f"key: {key}")
         idx: int = col_map.get(key)
-        print(idx)
+
         if idx is None or idx >= len(row):
-            print("going on")
             continue
-        print(row)
+
         value = row[idx] if isinstance(row, tuple) else row.iloc[idx]
-        print(f"value {value}")
         price = parse_price(value) if value else 0.0
         if price is not None and price > 0:
-            print(f"price: {price}")
             prices[key] = price
-            print(f"prices: {prices}")
 
-    print(f"prices haha")
     return prices
 
 
