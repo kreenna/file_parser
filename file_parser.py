@@ -1,3 +1,4 @@
+import os
 from dataclasses import dataclass, field
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -147,52 +148,59 @@ class ExcelParser:
 
         # ищем строку шапки: первая строка, где есть >=2 ячейки с буквами
         header_row: int = 0
-        while header_row < len(df) and df.iloc[header_row].astype(str).str.contains(r"[а-яa-z]", case=False, regex=True,
-                                                                                    na=False).sum() < 2:
-            header_row += 1
+        while True:
 
-        headers = df.iloc[header_row].astype(str)
+            while header_row < len(df) and df.iloc[header_row].astype(str).str.contains(r"[а-яa-z]", case=False, regex=True,
+                                                                                        na=False).sum() < 2:
+                header_row += 1
+
+            headers = df.iloc[header_row].astype(str)
+
+            COLUMN_KEYWORDS = {
+                "name": ["наименовани", "названи", "product", "item", "имя", "название товара", "номенклатур",
+                         "обозначени"],
+                "sku": ["артикул", "арт.", "код", "sku", "article", "модель"],
+                "unit": ["ед. измерения", "единица измерения", "unit", "ед. изм"],
+                "quantity": ["количество", "кол-во", "кол."],
+                # unit price (generic)
+                "price_unit": ["цена", "стоимость", "price", "расценк", "РРЦ", "МРЦ"],
+                # explicit “без НДС”
+                "price_base": ["цена без ндс", "без ндс", "без НДС", "цена за ед без ндс"],
+                # explicit “с НДС”
+                "price_vat": ["цена с ндс", "с НДС", "вкл. НДС", "цена с учетом ндс"],
+                # totals
+                "total_no_vat": ["стоимость без ндс", "сумма без ндс", "итого без ндс"],
+                "total_vat": ["стоимость с ндс", "сумма с ндс", "итого с ндс"],
+                "total": ["стоимость", "сумма", "итого", "всего", "total", "amount"],
+                "manufacturer": ["производител", "бренд", "vendor", "manufacturer", "поставщик"],
+                "notes": ["примечани", "notes", "описание", "комментари", "характеристик"]
+            }
+
+            col_map: dict[str, int] = {}
+            headers_list: list = headers.astype(str).tolist()
+
+            for col_type, keywords in COLUMN_KEYWORDS.items():
+                best_score = 0
+                best_idx = None
+
+                # проверяем совпадения по каждому слову и определяем лучшее
+                for keyword in keywords:
+                    match = process.extractOne(keyword, headers_list, scorer=fuzz.partial_ratio)
+
+                    if match and match[1] > best_score:
+                        best_score = match[1]
+                        best_idx = match[2]
+                if best_idx is not None and best_score >= 70:
+                    col_map[col_type] = best_idx
+
+            if not col_map or "name" not in col_map and "sku" not in col_map:
+                header_row += 1
+                continue
+
+            break
+
+        df = df.ffill(axis=0).ffill(axis=1)
         data = df.iloc[header_row + 1:].reset_index(drop=True)
-
-        COLUMN_KEYWORDS = {
-            "name": ["наименовани", "названи", "product", "item", "имя", "название товара", "номенклатур"],
-            "sku": ["артикул", "арт", "код", "sku", "article"],
-            "unit": ["ед. измерения", "единица измерения", "unit", "ед. изм"],
-            "quantity": ["количество", "кол-во", "кол."],
-            # unit price (generic)
-            "price_unit": ["цена", "стоимость", "price", "расценк"],
-            # explicit “без НДС”
-            "price_base": ["цена без ндс", "без ндс", "без НДС", "цена за ед без ндс"],
-            # explicit “с НДС”
-            "price_vat": ["цена с ндс", "с НДС", "вкл. НДС", "цена с учетом ндс"],
-            # totals
-            "total_no_vat": ["стоимость без ндс", "сумма без ндс", "итого без ндс"],
-            "total_vat": ["стоимость с ндс", "сумма с ндс", "итого с ндс"],
-            "total": ["стоимость", "сумма", "итого", "всего", "total", "amount"],
-            "manufacturer": ["производител", "бренд", "vendor", "manufacturer", "поставщик"],
-            "notes": ["примечани", "notes", "описание", "комментари"]
-        }
-
-        col_map: dict[str, int] = {}
-        headers_list: list = headers.astype(str).tolist()
-
-        for col_type, keywords in COLUMN_KEYWORDS.items():
-
-            best_score = 0
-            best_idx = None
-
-            # проверяем совпадения по каждому слову и определяем лучшее
-            for keyword in keywords:
-                match = process.extractOne(keyword, headers_list, scorer=fuzz.partial_ratio)
-
-                if match and match[1] > best_score:
-                    best_score = match[1]
-                    best_idx = match[2]
-            if best_idx is not None and best_score >= 70:
-                col_map[col_type] = best_idx
-
-        if "name" not in col_map and "sku" not in col_map:
-            return [], col_map
 
         items: list[dict] = []
         for _, row in data.iterrows():
