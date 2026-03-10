@@ -1,4 +1,3 @@
-import os
 from dataclasses import dataclass, field
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -146,93 +145,109 @@ class ExcelParser:
         if df.empty:
             return [], {}
 
-        # ищем строку шапки: первая строка, где есть >=2 ячейки с буквами
-        header_row: int = 0
-        while True:
-
-            while header_row < len(df) and df.iloc[header_row].astype(str).str.contains(r"[а-яa-z]", case=False, regex=True,
-                                                                                        na=False).sum() < 2:
-                header_row += 1
-
-            headers = df.iloc[header_row].astype(str)
-
-            COLUMN_KEYWORDS = {
-                "name": ["наименовани", "названи", "product", "item", "имя", "название товара", "номенклатур",
-                         "обозначени"],
-                "sku": ["артикул", "арт.", "код", "sku", "article", "модель"],
-                "unit": ["ед. измерения", "единица измерения", "unit", "ед. изм"],
-                "quantity": ["количество", "кол-во", "кол."],
-                # unit price (generic)
-                "price_unit": ["цена", "стоимость", "price", "расценк", "РРЦ", "МРЦ"],
-                # explicit “без НДС”
-                "price_base": ["цена без ндс", "без ндс", "без НДС", "цена за ед без ндс"],
-                # explicit “с НДС”
-                "price_vat": ["цена с ндс", "с НДС", "вкл. НДС", "цена с учетом ндс"],
-                # totals
-                "total_no_vat": ["стоимость без ндс", "сумма без ндс", "итого без ндс"],
-                "total_vat": ["стоимость с ндс", "сумма с ндс", "итого с ндс"],
-                "total": ["стоимость", "сумма", "итого", "всего", "total", "amount"],
-                "manufacturer": ["производител", "бренд", "vendor", "manufacturer", "поставщик"],
-                "notes": ["примечани", "notes", "описание", "комментари", "характеристик"]
-            }
-
+        try:
+            # ищем строку шапки: первая строка, где есть >=2 ячейки с буквами
+            header_row: int = 0
+            bonus_header: int = 0
             col_map: dict[str, int] = {}
-            headers_list: list = headers.astype(str).tolist()
 
-            for col_type, keywords in COLUMN_KEYWORDS.items():
-                best_score = 0
-                best_idx = None
+            while True:
 
-                # проверяем совпадения по каждому слову и определяем лучшее
-                for keyword in keywords:
-                    match = process.extractOne(keyword, headers_list, scorer=fuzz.partial_ratio)
+                while header_row < len(df) and df.iloc[header_row].astype(str).str.contains(r"[а-яa-z]", case=False,
+                                                                                            regex=True,
+                                                                                            na=False).sum() < 2:
+                    header_row += 1
 
-                    if match and match[1] > best_score:
-                        best_score = match[1]
-                        best_idx = match[2]
-                if best_idx is not None and best_score >= 70:
-                    col_map[col_type] = best_idx
+                headers = df.iloc[header_row].astype(str)
 
-            if not col_map or "name" not in col_map and "sku" not in col_map:
-                header_row += 1
-                continue
+                COLUMN_KEYWORDS = {
+                    "name": [" наименование ", " название ", "product", "item", " имя ", "название товара",
+                             " номенклатура "],
+                    "sku": ["артикул ", " арт.", "код ", "sku", "article", "тип ", "марка ", "марки ", "обозначение "],
+                    "unit": ["ед. измерения", "единица измерения", "unit", "ед. изм"],
+                    "quantity": ["количество", "кол-во", "кол.  "],
+                    # unit price (generic)
+                    "price_unit": ["цена ", "price", "расценк", "РРЦ ", "МРЦ "],
+                    # explicit “без НДС”
+                    "price_base": ["цена без ндс", "без ндс", "без НДС", "цена за ед без ндс"],
+                    # explicit “с НДС”
+                    "price_vat": ["цена с ндс", "с НДС", "вкл. НДС", "цена с учетом ндс"],
+                    # totals
+                    "total_no_vat": ["стоимость без ндс", "сумма без ндс", "итого без ндс"],
+                    "total_vat": ["стоимость с ндс", "сумма с ндс", "итого с ндс"],
+                    "total": ["стоимость", "сумма", "итого", "всего", "total", "amount"],
+                    "manufacturer": ["производител", "бренд", "vendor", "manufacturer", "поставщик"],
+                    "notes": ["примечани", "notes", "описание", "комментари", "характеристик"]
+                }
 
-            break
+                headers_list: list = headers.astype(str).tolist()
 
-        df = df.ffill(axis=0).ffill(axis=1)
-        data = df.iloc[header_row + 1:].reset_index(drop=True)
+                def safe_lower_processor(value):
+                    return value.lower() if isinstance(value, str) else value
 
-        items: list[dict] = []
-        for _, row in data.iterrows():
-            name_value = row.iloc[col_map["name"]] if "name" in col_map else ""
-            sku_value = row.iloc[col_map["sku"]] if "sku" in col_map else ""
-            unit_value = row.iloc[col_map["unit"]] if "unit" in col_map else ""
-            manufacturer_value = row.iloc[col_map["manufacturer"]] if "manufacturer" in col_map else ""
-            notes_value = row.iloc[col_map["notes"]] if "notes" in col_map else ""
+                for col_type, keywords in COLUMN_KEYWORDS.items():
 
-            prices = collect_prices_for_row(row, col_map)
+                    best_score = 0
+                    best_idx = None
 
-            quantity_value = row.iloc[col_map["quantity"]] if "quantity" in col_map else 0
-            quantity = parse_price(quantity_value) or 0
+                    # проверяем совпадения по каждому слову и определяем лучшее
+                    for keyword in keywords:
+                        match = process.extractOne(keyword, headers_list, processor=safe_lower_processor,
+                                                   scorer=fuzz.partial_ratio)
 
-            best_price = pick_best_price(prices, quantity or 0)
+                        if match and match[1] > best_score:
+                            best_score = match[1]
+                            best_idx = match[2]
+                    if best_idx is not None and best_score >= 80:
+                        col_map[col_type] = best_idx
 
-            item_values: dict = {
-                "name": str(name_value) if name_value and not pd.isna(name_value) else "",
-                "sku": str(sku_value) if sku_value and not pd.isna(sku_value) else "",
-                "unit": str(unit_value) if unit_value and not pd.isna(unit_value) else None,
-                "quantity": quantity,
-                "price": best_price,
-                "manufacturer": manufacturer_value,
-                "notes": notes_value if notes_value != name_value else ""
-            }
+                if len(col_map) < 7 and bonus_header < 1:
+                    header_row += 1
+                    bonus_header += 1
+                    continue
 
-            item = ExcelParser._build_item(item_values, raw_row=row, sku_col_idx=col_map.get("sku"))
+                if not col_map or "name" not in col_map and "sku" not in col_map:
+                    return [], {}
 
-            if item:
-                items.append(item)
+                break
 
-        return items, col_map
+            data = df.iloc[header_row + 1:].reset_index(drop=True)
+
+            items: list[dict] = []
+            for _, row in data.iterrows():
+                name_value = row.iloc[col_map["name"]] if "name" in col_map else ""
+                sku_value = row.iloc[col_map["sku"]] if "sku" in col_map else ""
+                unit_value = row.iloc[col_map["unit"]] if "unit" in col_map else ""
+                manufacturer_value = row.iloc[col_map["manufacturer"]] if "manufacturer" in col_map else ""
+                notes_value = row.iloc[col_map["notes"]] if "notes" in col_map else ""
+
+                prices = collect_prices_for_row(row, col_map)
+
+                quantity_value = row.iloc[col_map["quantity"]] if "quantity" in col_map else 0
+                quantity = parse_price(quantity_value) or 0
+
+                best_price = pick_best_price(prices, quantity or 0)
+
+                item_values: dict = {
+                    "name": str(name_value) if name_value and not pd.isna(name_value) else "",
+                    "sku": str(sku_value) if sku_value and not pd.isna(sku_value) else "",
+                    "unit": str(unit_value) if unit_value and not pd.isna(unit_value) else None,
+                    "quantity": quantity,
+                    "price": best_price,
+                    "manufacturer": manufacturer_value,
+                    "notes": notes_value if notes_value != name_value else ""
+                }
+
+                item = ExcelParser._build_item(item_values, raw_row=row, sku_col_idx=col_map.get("sku"))
+
+                if item:
+                    items.append(item)
+
+            return items, col_map
+
+        except IndexError:
+            # if the file is too short and it cant find the right indexed for the headers
+            return [], {}
 
     @staticmethod
     def _handle_success(res: ParseResult, items: list, col_map: dict, method_suffix: str, sep: str = None):
