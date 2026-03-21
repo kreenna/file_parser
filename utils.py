@@ -24,7 +24,7 @@ def parse_price(value) -> float | None:
         decimal_part = parts[-1]
         s = integer_part + "." + decimal_part if decimal_part else integer_part
 
-    # regex находим число без лишних данных
+    # c regex находим число без лишних данных
     m = re.search(r"[-+]?\d+(?:\.\d{0,2})?", s)
     if not m:
         return None
@@ -55,26 +55,29 @@ SIMPLE_HEADER_KEYWORDS = {
 
 
 def simple_match_header(row) -> dict[str, int]:
-    """
-    Очень простой матчинг заголовка по подстрокам.
-    Возвращает col_map: {\"name\": idx, ...}.
-    """
+    """Простой матчинг заголовка по подстрокам."""
 
     col_map: dict[str, int] = {}
 
     for idx, value in enumerate(row):
+        # проходимся по всем ячейкам строки
+
         if value is None:
             continue
+
         text = str(value).strip().lower()
         if not text or len(text) > 100:
             continue
+
         for col_type, keywords in SIMPLE_HEADER_KEYWORDS.items():
             if col_type in col_map:
                 continue
+
             for keyword in keywords:
                 if keyword in text:
                     col_map[col_type] = idx
                     break
+
     return col_map
 
 
@@ -84,6 +87,7 @@ def normalize_unit(unit: str) -> str:
     unit = unit.lower().strip()
     if not unit:
         return "шт"
+
     mapping = {
         "шт": ["шт", "штука", "штук"],
         "м": ["м", "метр", "метра", "метров"],
@@ -91,6 +95,7 @@ def normalize_unit(unit: str) -> str:
         "кг": ["кг", "килограмм", "килограмма", "килограммoв"],
         "л": ["л", "литр", "литра", "литров"],
     }
+
     for norm, variants in mapping.items():
         if any(variant in unit for variant in variants):
             return norm
@@ -103,25 +108,16 @@ def is_junk_row(text: str) -> bool:
     t = text.lower().strip()
     if not t:
         return True
+
     junk_words = ["итого", "всего", "номер", "№", "сумма", "огрн", "инн", "кпп", "окпо", "ооо", "г.", "ул.", "д.",
                   "стр."]
+
     if len(t) < 3:
         return True
     if sum(ch.isalpha() for ch in t) < 2 and sum(ch.isdigit() for ch in t) > 3:
         return True
+
     return any(w in t for w in junk_words)
-
-
-def extract_vendor(name: str) -> str:
-    """Получение поставщика."""
-
-    # простейшая эвристика: заглавные латинские слова 2–15 символов
-    tokens = re.split(r"[,\s;]+", name)
-    candidates = [
-        t for t in tokens
-        if 2 <= len(t) <= 15 and t.isupper() and any("A" <= ch <= "Z" for ch in t)
-    ]
-    return candidates[0] if candidates else ""
 
 
 def read_csv_iter(path: str, sep: str):
@@ -131,7 +127,7 @@ def read_csv_iter(path: str, sep: str):
 
 def collect_prices_for_row(row, col_map: dict) -> dict:
     """
-    Собирает все найденные ценовые значения по типам:
+    Сбор всех найденных ценовых значений по типам:
     price_base, price_unit, price_vat, total_no_vat, total_vat, total.
     """
 
@@ -146,6 +142,7 @@ def collect_prices_for_row(row, col_map: dict) -> dict:
 
         value = row[idx] if isinstance(row, tuple) else row.iloc[idx]
         price = parse_price(value) if value else 0.0
+
         if price is not None and price > 0:
             prices[key] = price
 
