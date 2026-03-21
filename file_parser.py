@@ -40,7 +40,7 @@ class ExcelParser:
         """Метод фактического парсинга файла, возвращает объект ParseResult с данными о файле и содержимом."""
 
         f_path = Path(file_path)
-        result = ParseResult(file_path=file_path, file_hash=hash_file(p))
+        result = ParseResult(file_path=file_path, file_hash=hash_file(f_path))
 
         # пробуем парсить файл в зависимости от его формата
         try:
@@ -59,7 +59,7 @@ class ExcelParser:
             result.needs_ai = (result.confidence < AI_FALLBACK_THRESHOLD or not result.items)
 
         except Exception as e:
-            logger.error("parse_error", file=str(p), error=str(e))
+            logger.error("parse_error", file=str(f_path), error=str(e))
             result.errors.append(str(e))
             result.needs_ai = True
 
