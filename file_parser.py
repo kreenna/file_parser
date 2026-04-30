@@ -1,4 +1,5 @@
-from dataclasses import dataclass, field
+import json
+from dataclasses import dataclass, field, asdict
 from pathlib import Path
 from typing import Optional
 
@@ -23,6 +24,22 @@ class ParseResult:
     errors: list[str] = field(default_factory=list)
     method: str = "none"
     col_map: dict = field(default_factory=dict)
+
+    def to_dict(self) -> dict:
+        """Превращает результат в словарь."""
+        data = asdict(self)
+        return data
+
+    def write_parse_result_to_json(self, output_path: Path) -> None:
+        """Записывает результат в JSON файл."""
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        with output_path.open("w", encoding="utf-8") as f:
+            json.dump(
+                self.to_dict(),
+                f,
+                indent=2,
+                ensure_ascii=False,
+            )
 
 
 class ExcelParser:

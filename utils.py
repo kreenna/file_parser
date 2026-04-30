@@ -1,4 +1,5 @@
 import re
+from pathlib import Path
 from typing import Optional
 
 import pandas as pd
@@ -184,3 +185,8 @@ def pick_best_price(prices: dict, quantity: float | None = None, vat_rate: Optio
             return prices[key]
 
     return 0.0
+
+
+def get_output_json_path(input_file: str) -> Path:
+    in_path = Path(input_file)
+    return in_path.with_suffix(".json")
