@@ -26,13 +26,12 @@ class ParseResult:
     col_map: dict = field(default_factory=dict)
 
     def to_dict(self) -> dict:
-        """
-        Convert ParseResult to a JSON‑serializable dict.
-        """
+        """Превращает результат в словарь."""
         data = asdict(self)
         return data
 
     def write_parse_result_to_json(self, output_path: Path) -> None:
+        """Записывает результат в JSON файл."""
         output_path.parent.mkdir(parents=True, exist_ok=True)
         with output_path.open("w", encoding="utf-8") as f:
             json.dump(
@@ -133,10 +132,12 @@ class ExcelParser:
 
                 # проходимся по каждому листу
                 for sheet_name in xls.sheet_names:
+                    print(sheet_name)
                     df = xls.parse(sheet_name=sheet_name, dtype=str, header=None)
                     items, col_map = self._parse_dataframe_with_fuzzy(df)
 
                     if items:
+                        print("yes items")
                         sheet_items.extend(items)
                         if not result.col_map:
                             result.col_map = col_map
@@ -176,6 +177,7 @@ class ExcelParser:
                 # цикл для перебора строк шапки для поиска всех полей (multi-headers)
 
                 headers = df.iloc[header_row].astype(str)
+                print(headers)
 
                 COLUMN_KEYWORDS = {
                     "name": ["наименование ", "название ", "product", "item", " имя", "название товара",
@@ -224,12 +226,15 @@ class ExcelParser:
                 if not any(k in col_map for k in ["name", "sku"]) or not any(
                         k in col_map for k in ["price_unit", "price_base", "price_vat", "total"]) or not any(
                     k in col_map for k in ["unit", "quantity", "manufacturer", "notes"]):
+                    print(header_row)
+                    print("try more")
                     # если не хватает значений, проверяем следующую строку (multi-headers), проходимся до десятой
                     header_row += 1
                     bonus_row += 1
                     continue
 
                 if not col_map or "name" not in col_map and "sku" not in col_map:
+                    print("was not found")
                     return [], {}
 
                 if bonus_row < 1:
@@ -273,6 +278,7 @@ class ExcelParser:
 
                 if item:
                     items.append(item)
+            print(col_map)
             return items, col_map
 
         except IndexError:
@@ -436,7 +442,7 @@ class ExcelParser:
             """Метод для корректной обработки NaN."""
             if pd.isna(value) or value == "":
                 return ""
-            if hasattr(value, "item"):  # Series-like
+            if hasattr(value, 'item'):  # Series-like
                 value = value.item()
             return str(value).strip()
 
