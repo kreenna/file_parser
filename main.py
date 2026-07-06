@@ -3,7 +3,7 @@ import os
 from file_parser import ExcelParser
 from utils import get_output_json_path
 
-file_name = "Токовый расчет.xlsx"
+file_name = "ekf_pricelist_2026-03-14.xlsx"
 
 if __name__ == "__main__":
     parser = ExcelParser()

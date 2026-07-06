@@ -5,11 +5,10 @@ from typing import Optional
 
 import pandas as pd
 import structlog
-from rapidfuzz import process, fuzz
 
 from metrics import quality, hash_file
 from utils import parse_price, normalize_unit, is_junk_row, read_csv_iter, simple_match_header, collect_prices_for_row, \
-    pick_best_price
+    pick_best_price, detect_table_regions, find_col_map_header_row
 
 logger = structlog.get_logger()
 
@@ -33,10 +32,10 @@ class ParseResult:
     def write_parse_result_to_json(self, output_path: Path) -> None:
         """Записывает результат в JSON файл."""
         output_path.parent.mkdir(parents=True, exist_ok=True)
-        with output_path.open("w", encoding="utf-8") as f:
+        with output_path.open("w", encoding="utf-8") as file:
             json.dump(
                 self.to_dict(),
-                f,
+                file,
                 indent=2,
                 ensure_ascii=False,
             )
@@ -128,22 +127,30 @@ class ExcelParser:
                     fallback_method = self._standard_xls_fallback
 
                 xls = readers[0](str(file_path))  # pd.ExcelFile для xlsx/xls
-                sheet_items = []
+                sheet_items: list[dict] = []
 
                 # проходимся по каждому листу
                 for sheet_name in xls.sheet_names:
-                    print(sheet_name)
+                    sheet_last_col_map: dict = {}
                     df = xls.parse(sheet_name=sheet_name, dtype=str, header=None)
-                    items, col_map = self._parse_dataframe_with_fuzzy(df)
 
-                    if items:
-                        print("yes items")
-                        sheet_items.extend(items)
-                        if not result.col_map:
-                            result.col_map = col_map
+                    # detect all table regions in this sheet
+                    regions = detect_table_regions(df)
+
+                    for (r0, r1, c0, c1) in regions:
+                        sub_df = df.iloc[r0:r1 + 1, c0:c1 + 1]
+                        items, col_map = self._parse_dataframe_with_fuzzy(sub_df, fallback_col_map=sheet_last_col_map)
+
+                        if items:
+                            sheet_items.extend(items)
+
+                            if col_map:
+                                sheet_last_col_map = col_map.copy()
+
+                            result.col_map = sheet_last_col_map.copy()
 
                 if sheet_items:
-                    self._handle_success(result, sheet_items, col_map, "fuzzy")
+                    self._handle_success(result, sheet_items, result.col_map, "fuzzy")
                     logger.info(f"fuzzy_ok_{file_type}", items=len(sheet_items), conf=f"{result.confidence:.2f}")
                     return
 
@@ -156,94 +163,25 @@ class ExcelParser:
     # парсинг с fuzzy
 
     @staticmethod
-    def _parse_dataframe_with_fuzzy(df: pd.DataFrame) -> tuple[list[dict], dict]:
+    def _parse_dataframe_with_fuzzy(df: pd.DataFrame, fallback_col_map: dict | None = None) -> tuple[list[dict], dict]:
         """Парсинг файла с использованием Fuzzy для поиска данных."""
 
         if df.empty:
             return [], {}
 
+        col_map: dict = {}
+        header_row: int = 0
+
         try:
             # ищем строку шапки: первая строка, где есть >=2 ячейки с буквами
-            header_row: int = 0
-            bonus_row: int = 0
-            col_map: dict[str, int] = {}
+            col_map_result, header_end_row_result = find_col_map_header_row(df)
 
-            while header_row < len(df) and df.iloc[header_row].astype(str).str.contains(r"[а-яa-z]", case=False,
-                                                                                        regex=True,
-                                                                                        na=False).sum() < 2:
-                header_row += 1
+            if col_map_result:
+                col_map = col_map_result
+            elif fallback_col_map:
+                col_map = fallback_col_map.copy()
 
-            while bonus_row < 20:
-                # цикл для перебора строк шапки для поиска всех полей (multi-headers)
-
-                headers = df.iloc[header_row].astype(str)
-                print(headers)
-
-                COLUMN_KEYWORDS = {
-                    "name": ["наименование ", "название ", "product", "item", " имя", "название товара",
-                             "номенклатура "],
-                    "sku": ["артикул ", " арт.", "код ", "sku", "article", "тип ", "марка ", "марки ", "обозначение ",
-                            " модель"],
-                    "unit": ["ед. измерения", "единица измерения", "unit", "ед. изм"],
-                    "quantity": ["количество", "кол-во", "кол.  "],
-                    # unit price (generic)
-                    "price_unit": [" цена", "price", "расценка ", "РРЦ "],
-                    # explicit “без НДС”
-                    "price_base": [" цена без ндс", "без ндс", "без НДС", "цена за ед без ндс"],
-                    # explicit “с НДС”
-                    "price_vat": [" цена с ндс", "с НДС", "вкл. НДС", "цена с учетом ндс", "базовая цена с ндс"],
-                    # totals
-                    "total_no_vat": ["стоимость без ндс", "сумма без ндс", "итого без ндс"],
-                    "total_vat": ["стоимость с ндс", "сумма с ндс", "итого с ндс"],
-                    "total": ["стоимость ", "сумма ", "итого ", "всего ", "total ", "amount "],
-                    "manufacturer": ["производитель ", "бренд", "vendor", "manufacturer", "поставщик "],
-                    "notes": ["примечани", "notes", "описание", "комментари", "характеристик"]
-                }
-
-                headers_list: list = headers.astype(str).tolist()
-
-                def safe_lower_processor(value):
-                    """Обработчик для приведения содержимого сроки к нижнему регистру без ошибок."""
-                    return value.lower() if isinstance(value, str) else value
-
-                for col_type, keywords in COLUMN_KEYWORDS.items():
-                    # проходимся по каждому типу и ключевому слову
-
-                    best_score = 0
-                    best_idx = None
-
-                    for keyword in keywords:
-                        # проверяем совпадения по каждому слову и определяем лучшее
-                        match = process.extractOne(keyword, headers_list, processor=safe_lower_processor,
-                                                   scorer=fuzz.partial_ratio)
-
-                        if match and match[1] > best_score:
-                            best_score = match[1]
-                            best_idx = match[2]
-                    if best_idx is not None and best_score >= 80:
-                        col_map[col_type] = best_idx
-
-                if not any(k in col_map for k in ["name", "sku"]) or not any(
-                        k in col_map for k in ["price_unit", "price_base", "price_vat", "total"]) or not any(
-                    k in col_map for k in ["unit", "quantity", "manufacturer", "notes"]):
-                    print(header_row)
-                    print("try more")
-                    # если не хватает значений, проверяем следующую строку (multi-headers), проходимся до десятой
-                    header_row += 1
-                    bonus_row += 1
-                    continue
-
-                if not col_map or "name" not in col_map and "sku" not in col_map:
-                    print("was not found")
-                    return [], {}
-
-                if bonus_row < 1:
-                    # если проверили только одну строку, проверяем следующую (на всякий случай для multi-headers)
-                    header_row += 1
-                    bonus_row += 1
-                    continue
-
-                break
+            header_row = header_end_row_result if header_end_row_result is not None else header_row
 
             data = df.iloc[header_row + 1:].reset_index(drop=True)
             items: list[dict] = []
@@ -278,7 +216,7 @@ class ExcelParser:
 
                 if item:
                     items.append(item)
-            print(col_map)
+
             return items, col_map
 
         except IndexError:
