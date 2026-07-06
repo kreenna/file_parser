@@ -1,8 +1,49 @@
 import re
 from pathlib import Path
-from typing import Optional
+from typing import Optional, List, Tuple, Any
 
+import numpy as np
 import pandas as pd
+from rapidfuzz import fuzz, process
+
+COLUMN_KEYWORDS = {
+    "name": ["наименование ", "название ", "product", "item", " имя", "название товара",
+             "номенклатура "],
+    "sku": ["артикул ", " арт.", "код ", "sku", "article", "тип ", "марка ", "марки ", "обозначение ",
+            " модель"],
+    "unit": ["ед. измерения", "единица измерения", "unit", "ед. изм"],
+    "quantity": ["количество", "кол-во", "кол.  "],
+    # unit price (generic)
+    "price_unit": [" цена", "price", "расценка ", "РРЦ "],
+    # explicit “без НДС”
+    "price_base": [" цена без ндс", "без ндс", "без НДС", "цена за ед без ндс"],
+    # explicit “с НДС”
+    "price_vat": [" цена с ндс", "с НДС", "вкл. НДС", "цена с учетом ндс", "базовая цена с ндс"],
+    # totals
+    "total_no_vat": ["стоимость без ндс", "сумма без ндс", "итого без ндс"],
+    "total_vat": ["стоимость с ндс", "сумма с ндс", "итого с ндс"],
+    "total": ["стоимость ", "сумма ", "итого ", "всего ", "total ", "amount "],
+    "manufacturer": ["производитель ", "бренд", "vendor", "manufacturer", "поставщик "],
+    "notes": ["примечани", "notes", "описание", "комментари", "характеристик"]
+}
+
+SIMPLE_HEADER_KEYWORDS = {
+    "name": ["наименован", "назван", "товар", "позици", "description", "item", "product"],
+    "sku": ["артикул", "арт", "код", "sku", "article"],
+    "unit": ["ед", "ед. изм", "ед.изм", "единиц", "unit", "изм"],
+    "quantity": ["количество", "кол-во", "кол."],
+    "price_unit": ["цена", "стоимость", "price", "расценк", "РРЦ", "МРЦ"],
+    # explicit “без НДС”
+    "price_base": ["цена без ндс", "без ндс", "без НДС", "цена за ед без ндс"],
+    # explicit “с НДС”
+    "price_vat": ["цена с ндс", "с НДС", "вкл. НДС", "цена с учетом ндс"],
+    # totals
+    "total_no_vat": ["стоимость без ндс", "сумма без ндс", "итого без ндс"],
+    "total_vat": ["стоимость с ндс", "сумма с ндс", "итого с ндс"],
+    "total": ["стоимость", "сумма", "итого", "всего", "total", "amount"],
+    "manufacturer": ["производ", "бренд", "vendor", "manufacturer", "поставщик"],
+    "notes": ["примечан", "коммент", "notes", "описан", "description"],
+}
 
 
 def parse_price(value) -> float | None:
@@ -34,25 +75,6 @@ def parse_price(value) -> float | None:
         return float(m.group(0))
     except ValueError:
         return None
-
-
-SIMPLE_HEADER_KEYWORDS = {
-    "name": ["наименован", "назван", "товар", "позици", "description", "item", "product"],
-    "sku": ["артикул", "арт", "код", "sku", "article"],
-    "unit": ["ед", "ед. изм", "ед.изм", "единиц", "unit", "изм"],
-    "quantity": ["количество", "кол-во", "кол."],
-    "price_unit": ["цена", "стоимость", "price", "расценк", "РРЦ", "МРЦ"],
-    # explicit “без НДС”
-    "price_base": ["цена без ндс", "без ндс", "без НДС", "цена за ед без ндс"],
-    # explicit “с НДС”
-    "price_vat": ["цена с ндс", "с НДС", "вкл. НДС", "цена с учетом ндс"],
-    # totals
-    "total_no_vat": ["стоимость без ндс", "сумма без ндс", "итого без ндс"],
-    "total_vat": ["стоимость с ндс", "сумма с ндс", "итого с ндс"],
-    "total": ["стоимость", "сумма", "итого", "всего", "total", "amount"],
-    "manufacturer": ["производ", "бренд", "vendor", "manufacturer", "поставщик"],
-    "notes": ["примечан", "коммент", "notes", "описан", "description"],
-}
 
 
 def simple_match_header(row) -> dict[str, int]:
@@ -100,7 +122,7 @@ def normalize_unit(unit: str) -> str:
     for norm, variants in mapping.items():
         if any(variant in unit for variant in variants):
             return norm
-    return unit
+    return ""
 
 
 def is_junk_row(text: str) -> bool:
@@ -188,5 +210,235 @@ def pick_best_price(prices: dict, quantity: float | None = None, vat_rate: Optio
 
 
 def get_output_json_path(input_file: str) -> Path:
+    """Меняет формат файла на JSON."""
     in_path = Path(input_file)
     return in_path.with_suffix(".json")
+
+
+def detect_table_regions(df: pd.DataFrame,
+                         min_rows: int = 3,
+                         min_cols: int = 2,
+                         max_empty_row_gap: int = 2) -> List[Tuple[int, int, int, int]]:
+    """
+    Поиск прямоугольных регионов таблиц на всем листе.
+
+    Возвращает список (row_start, row_end, col_start, col_end) углов региона
+    в df для каждой таблицы. Использует пустые строки и столбцы как разделители.
+    """
+
+    # True where cell has non‑empty, non‑whitespace content
+    mask = df.map(lambda x: isinstance(x, str) and x.strip() != "")
+    mask |= df.map(lambda x: not isinstance(x, str) and pd.notna(x))
+    has_value = mask.values.copy()  # shape [n_rows, n_cols]
+
+    n_rows, n_cols = has_value.shape
+
+    # "склеиваем" короткие вертикальные разрывы
+    for col in range(n_cols):
+        row = 0
+        while row < n_rows:
+            # пропускаем пустые снизу/сверху
+            if has_value[row, col]:
+                row += 1
+                continue
+
+            start = row
+            while row < n_rows and not has_value[row, col]:
+                row += 1
+            end = row  # [start, end) — подряд пустые
+
+            gap_len = end - start
+            # если по обе стороны есть данные и разрыв маленький — считаем его частью таблицы
+            if 0 < gap_len <= max_empty_row_gap:
+                if start > 0 and end < n_rows:
+                    if has_value[start - 1, col] and has_value[end, col]:
+                        has_value[start:end, col] = True
+
+    visited = np.zeros_like(has_value, dtype=bool)
+    regions: List[Tuple[int, int, int, int]] = []
+
+    def bfs(r0: int, c0: int):
+        """Flood‑fill для получения всех блоков с данными."""
+        stack = [(r0, c0)]
+        visited[r0, c0] = True
+        row_min = row_max = r0
+        col_min = col_max = c0
+
+        while stack:
+            r, c = stack.pop()
+
+            # обновляем границы
+            row_min = min(row_min, r)
+            row_max = max(row_max, r)
+            col_min = min(col_min, c)
+            col_max = max(col_max, c)
+
+            # 4‑соседство
+            for dr, dc in ((1, 0), (-1, 0), (0, 1), (0, -1)):
+                rr, cc = r + dr, c + dc
+                if 0 <= rr < n_rows and 0 <= cc < n_cols:
+                    if has_value[rr, cc] and not visited[rr, cc]:
+                        visited[rr, cc] = True
+                        stack.append((rr, cc))
+
+        return row_min, row_max, col_min, col_max
+
+    for r in range(n_rows):
+        for c in range(n_cols):
+            if has_value[r, c] and not visited[r, c]:
+                r0, r1, c0, c1 = bfs(r, c)
+
+                # "сырой" bounding box
+                sub = has_value[r0:r1 + 1, c0:c1 + 1]
+
+                # drop empty outer rows
+                while sub.shape[0] > 0 and not sub[0].any():
+                    r0 += 1
+                    sub = has_value[r0:r1 + 1, c0:c1 + 1]
+                while sub.shape[0] > 0 and not sub[-1].any():
+                    r1 -= 1
+                    sub = has_value[r0:r1 + 1, c0:c1 + 1]
+                # drop empty outer cols
+                while sub.shape[1] > 0 and not sub[:, 0].any():
+                    c0 += 1
+                    sub = has_value[r0:r1 + 1, c0:c1 + 1]
+                while sub.shape[1] > 0 and not sub[:, -1].any():
+                    c1 -= 1
+                    sub = has_value[r0:r1 + 1, c0:c1 + 1]
+
+                # фильтр по минимальному размеру
+                if (r1 - r0 + 1) >= min_rows and (c1 - c0 + 1) >= min_cols:
+                    regions.append((r0, r1, c0, c1))
+
+    return regions
+
+
+def score_header_row(col_map: dict[str, int]) -> int:
+    """
+    Оценка строки в соответствии с headers, которые были найдены.
+    """
+    score = 0
+
+    if "name" in col_map:
+        score += 30
+    if "sku" in col_map:
+        score += 30
+
+    for key in ["unit", "quantity", "manufacturer", "notes"]:
+        if key in col_map:
+            score += 10
+
+    for key in ["price_unit", "price_base", "price_vat", "total_no_vat", "total_vat", "total"]:
+        if key in col_map:
+            score += 6
+
+    score += len(col_map) * 2
+    return score
+
+
+def merge_missing(base_map: dict[str, int], candidate_map: dict[str, int]) -> dict[str, int]:
+    """
+    Включение отсутствующих headers из строк после основной строки с headers (multi-headers processing).
+    """
+    merged_map = dict(base_map)
+    for key, value in candidate_map.items():
+        if key not in merged_map:
+            merged_map[key] = value
+    return merged_map
+
+
+def merge_keep_old(base: dict[str, int], candidate_map: dict[str, int]) -> dict[str, int]:
+    """
+    Переписывание старых headers на более актуальные без удаления оставшихся.
+    """
+    merged_map = dict(base)
+    for key, idx in candidate_map.items():
+        merged_map[key] = idx
+    return merged_map
+
+
+def safe_lower_processor(value):
+    """Обработчик для приведения содержимого сроки к нижнему регистру без ошибок."""
+    return value.lower() if isinstance(value, str) else value
+
+
+def match_keyword_headers(headers_list: list, col_map: dict[str, int] = None) -> dict[str, int]:
+    """
+    Проверка названий из строки на соответствие с headers столбцов.
+    """
+
+    col_map = dict(col_map or {})
+
+    for col_type, keywords in COLUMN_KEYWORDS.items():
+        # проходимся по каждому типу и ключевому слову
+
+        best_score = 0
+        best_idx = None
+
+        for keyword in keywords:
+            # проверяем совпадения по каждому слову и определяем лучшее
+            match = process.extractOne(keyword, headers_list, processor=safe_lower_processor,
+                                       scorer=fuzz.partial_ratio)
+
+            if match and match[1] > best_score:
+                best_score = match[1]
+                best_idx = match[2]
+
+        if best_idx is not None and best_score >= 80:
+            col_map[col_type] = best_idx
+
+    return col_map
+
+
+CORE_KEYS = {"name", "sku"}
+OPTIONAL_KEYS = {"unit", "quantity", "manufacturer", "notes", "price_unit", "price_base", "price_vat", "total_no_vat",
+                 "total_vat", "total"}
+
+
+def find_col_map_header_row(df: pd.DataFrame, lookahead: int = 3) -> tuple[dict[str, int], int | Any]:
+    """
+    Поиск строки с headers.
+    """
+    # ищем строку шапки: первая строка, где есть >=2 ячейки с буквами
+    header_row: int = 0
+
+    # non-empty rows containing text
+    while header_row < len(df) and df.iloc[header_row].astype(str).str.contains(r"[а-яa-z]", case=False,
+                                                                                regex=True,
+                                                                                na=False).sum() < 2:
+        header_row += 1
+
+    if header_row >= len(df):  # если строка за пределами таблицы, завершаем работу
+        return {}, 0
+
+    base_map: dict[str, int] = {}
+    best_score = -1
+    last_header_row = header_row
+
+    for offset in range(lookahead):
+        row_idx = header_row + offset
+
+        if row_idx >= len(df):  # если следующих строк нет, завершаем цикл
+            break
+
+        candidate_map = match_keyword_headers(df.iloc[row_idx].astype(str).tolist(), {})
+        candidate_score = score_header_row(candidate_map)
+
+        if not candidate_score:  # если нет основных полей, продолжаем цикл
+            continue
+
+        if not base_map:
+            base_map = dict(candidate_map)
+            best_score = candidate_score
+            last_header_row = row_idx
+            continue
+
+        if candidate_score > best_score:
+            base_map = merge_keep_old(base_map, candidate_map)
+            best_score = candidate_score
+            last_header_row = row_idx
+
+        else:
+            base_map = merge_missing(base_map, candidate_map)
+
+    return base_map, last_header_row
